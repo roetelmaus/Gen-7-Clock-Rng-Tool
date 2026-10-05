@@ -1,0 +1,62 @@
+{
+  "window_title_contains": "Citra Nightly 2103",
+  "templates_dir": "templates",
+  "processing_scale": 1.0,
+  "obs_content_alignment_threshold": 0.9,
+  "manual_alignment_clock_trigger_score": 0.7,
+  "alignment_max_match_attempts": 12,
+  "obs_content_refinement_range": 0.5,
+  "obs_content_small_clock_pixel_limit": 35,
+  "obs_content_small_clock_threshold": 0.9,
+  "show_score_debug": false,
+  "use_previous_template_after_threshold": false,
+  "quality_variants": true,
+  "first_on_appear_output_offset": 4,
+  "roi": {
+    "x": 802,
+    "y": 84,
+    "width": 75,
+    "height": 74,
+    "reference_width": 2000,
+    "reference_height": 1177
+  },
+  "match_threshold": 0.9,
+  "first_on_appear_start_threshold": 0.9,
+  "invalid_clock_presence_threshold": 0.65,
+  "match_margin_threshold": 0.02,
+  "discriminative_pixel_weight_strength": 1.6,
+  "prefer_later_stage_when_close": false,
+  "later_stage_close_margin": 0.04,
+  "pairwise_refinement_enabled": true,
+  "pairwise_close_margin": 0.2,
+  "pairwise_hand_weight": 0.9,
+  "pairwise_refinement_pairs": [
+    [
+      "1",
+      "7"
+    ],
+    [
+      "2",
+      "7"
+    ],
+    [
+      "2",
+      "3"
+    ]
+  ],
+  "classification_method": "hand_geometry",
+  "geometry_min_score": 0.35,
+  "geometry_min_margin": 0.02,
+  "geometry_alignment_radius": 2,
+  "stage_count": 17,
+  "stable_frames_required": 2,
+  "first_on_appear_stable_frames_required": 1,
+  "stable_window_size": 6,
+  "lost_frames_required": 5,
+  "show_preview": true,
+  "debug_top_matches": false,
+  "max_fps": 40,
+  "preview_fps": 10,
+  "idle_after_seconds": 120,
+  "idle_scan_fps": 1
+}
