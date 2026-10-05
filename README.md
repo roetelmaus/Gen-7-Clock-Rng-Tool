@@ -1,7 +1,10 @@
 # Gen 7 Clock RNG Tool
 
 A Windows desktop tool that recognizes Gen 7 clock positions from a selected
-game, emulator, or OBS projector window and converts them into RNG values.
+game, emulator, or OBS projector window and shows the starting clock hands.
+
+This tool is intended as a helper for **3DSRNGTool**. In 3DSRNGTool's
+**Gen 7 Main RNG Tool**, select **Start Position** when using the results.
 
 ## Download
 
