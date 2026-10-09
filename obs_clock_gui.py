@@ -17,21 +17,29 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from obs_clock_detector import (
-    compare_to_templates,
     load_templates,
     make_discriminative_weight_map,
     scaled_roi,
 )
 from window_capture import WindowCapture, list_visible_windows
 from quality_matcher import QualityMatcher
+from screen_tracker import ScreenTracker
 
 
 class ClockDetectorGui:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Gen 7 Clock RNG V2")
+        self.root.title("Gen 7 Clock RNG V2.1")
         self.root.geometry("1120x760")
         self.root.minsize(900, 640)
+        self.screen_lock = threading.Lock()
+        self.screen_tracker = None
+        self.selecting_screen = False
+        self.screen_points = []
+        self.screen_selection_frame = None
+        self.screen_tracking_lost = False
+        self.screen_tracking_loss_since = None
+        self.tracking_warning_visible = False
 
         self.resource_dir = (
             Path(sys._MEIPASS)
@@ -63,6 +71,7 @@ class ClockDetectorGui:
         self.alignment_applied_event = threading.Event()
         self.alignment_request_lock = threading.Lock()
         self.alignment_generation = 0
+        self.calibration_restart_notice_shown = False
         self.pending_alignment_box: tuple[int, int, int, int] | None = None
         self.alignment_frame_queue: queue.Queue = queue.Queue(maxsize=12)
         self.alignment_wait_stop_event = threading.Event()
@@ -174,17 +183,6 @@ class ClockDetectorGui:
         offset = int(self.config.get("first_on_appear_output_offset", 4))
         return str((number + offset) % stage_count)
 
-    def previous_template_label(self, detected_label: str) -> str:
-        if not self.config.get("use_previous_template_after_threshold", True):
-            return detected_label
-        try:
-            number = int(detected_label)
-        except ValueError:
-            return detected_label
-
-        stage_count = int(self.config.get("stage_count", 17))
-        return str((number - 1) % stage_count)
-
     def build_ui(self) -> None:
         self.root.configure(bg="#151719")
         style = ttk.Style()
@@ -195,13 +193,13 @@ class ClockDetectorGui:
         style.configure("Title.TLabel", background="#151719", foreground="#ffffff", font=("Segoe UI", 18, "bold"))
         style.configure("Value.TLabel", background="#202326", foreground="#ffd84d", font=("Segoe UI", 34, "bold"))
         style.configure("Number.TLabel", background="#202326", foreground="#ffffff", font=("Segoe UI", 16, "bold"))
-        style.configure("Status.TLabel", background="#151719", foreground="#b6bec6", font=("Segoe UI", 10))
+        style.configure("Status.TLabel", background="#293a40", foreground="#ffffff", font=("Segoe UI", 12, "bold"), padding=(14, 12))
         style.configure("TButton", font=("Segoe UI", 11, "bold"), padding=(14, 9))
         style.configure("TCombobox", padding=6)
 
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=18, pady=(14, 10))
-        ttk.Label(header, text="Gen 7 Clock RNG V2", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Gen 7 Clock RNG V2.1", style="Title.TLabel").pack(side="left")
 
         controls = ttk.Frame(header)
         controls.pack(side="right")
@@ -231,6 +229,12 @@ class ClockDetectorGui:
         self.refresh_window_choices()
 
         body = ttk.Frame(self.root)
+        webcam_controls = ttk.Frame(self.root)
+        webcam_controls.pack(fill="x", padx=18, pady=(0, 8))
+        self.webcam_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(webcam_controls, text="Webcam Mode", variable=self.webcam_mode_var,
+                        command=self.change_webcam_mode).pack(side="left")
+        ttk.Button(webcam_controls, text="Set Screen Corners", command=self.begin_screen_selection).pack(side="left", padx=8)
         body.pack(fill="both", expand=True, padx=18, pady=(0, 12))
 
         preview_panel = ttk.Frame(body, style="Panel.TFrame")
@@ -240,6 +244,7 @@ class ClockDetectorGui:
         self.canvas.bind("<ButtonPress-1>", self.start_alignment_drag)
         self.canvas.bind("<B1-Motion>", self.drag_alignment_box)
         self.canvas.bind("<ButtonRelease-1>", self.end_alignment_drag)
+        self.canvas.bind("<Configure>", self.resize_preview_warning)
 
         results = ttk.Frame(body, style="Panel.TFrame", width=360)
         results.pack(side="right", fill="y", padx=(12, 0))
@@ -336,7 +341,10 @@ class ClockDetectorGui:
             justify="center",
         ).pack(side="bottom", pady=20)
 
-        ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel").pack(fill="x", padx=20, pady=(0, 12))
+        self.status_label = ttk.Label(self.root, textvariable=self.status_var,
+                                      style="Status.TLabel", anchor="w", justify="left", wraplength=850)
+        self.status_label.pack(fill="x", padx=18, pady=(0, 12))
+        self.status_label.bind("<Configure>", lambda event: self.status_label.configure(wraplength=max(100, event.width - 32)))
 
     def start_worker(self) -> None:
         self.worker = threading.Thread(target=self.capture_loop, daemon=True)
@@ -399,6 +407,16 @@ class ClockDetectorGui:
         if not source_changed:
             return
 
+        self.calibration_restart_notice_shown = False
+        self.tracking_warning_visible = False
+
+        with self.screen_lock:
+            self.screen_tracker = None
+        self.selecting_screen = False
+        self.screen_selection_frame = None
+        self.screen_tracking_lost = False
+        self.screen_tracking_loss_since = None
+
         self.cancel_alignment()
 
         self.config["window_title_contains"] = title
@@ -412,7 +430,83 @@ class ClockDetectorGui:
         self.reset_event.set()
         self.status_var.set("Window selected. Set Clock Box to begin detection.")
 
+    def change_webcam_mode(self) -> None:
+        self.calibration_restart_notice_shown = False
+        self.tracking_warning_visible = False
+        self.detect_event.clear()
+        self.cancel_alignment()
+        with self.screen_lock:
+            self.screen_tracker = None
+        self.selecting_screen = False
+        self.screen_selection_frame = None
+        self.screen_tracking_lost = False
+        self.screen_tracking_loss_since = None
+        with self.alignment_lock:
+            self.alignment_matrix = None
+            self.alignment_source_size = None
+        self.config.pop("obs_content_alignment", None)
+        self.save_config()
+        self.roi_preview_event.clear()
+        self.status_var.set("Set the four screen corners." if self.webcam_mode_var.get() else "Set Clock Box to begin detection.")
+
+    def begin_screen_selection(self) -> None:
+        if not self.webcam_mode_var.get():
+            self.status_var.set("Enable Webcam Mode first.")
+            return
+        if self.search_stopped_event.is_set():
+            self.status_var.set("Press Restart first.")
+            return
+        self.change_webcam_mode()
+        self.screen_points = []
+        self.screen_selection_frame = None
+        self.selecting_screen = True
+        self.canvas.configure(cursor="crosshair")
+        self.status_var.set("Click the SCREEN corners: top-left, top-right, bottom-right, bottom-left.")
+
+    def add_screen_corner(self, event) -> None:
+        frame = self.screen_selection_frame
+        if frame is None or self.current_frame is not frame:
+            return
+        x = (event.x - self.display_offset_x) / self.display_scale
+        y = (event.y - self.display_offset_y) / self.display_scale
+        if not (0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
+            return
+        self.screen_points.append((x, y))
+        if len(self.screen_points) < 4:
+            self.draw_frame(frame)
+            return
+        try:
+            tracker = ScreenTracker(frame, self.screen_points)
+        except ValueError as error:
+            self.screen_points = []
+            self.status_var.set(str(error))
+            return
+        with self.screen_lock:
+            self.screen_tracker = tracker
+        self.selecting_screen = False
+        self.screen_selection_frame = None
+        self.canvas.configure(cursor="")
+        self.status_var.set("Screen corners set. Set Clock Box, then restart the game after calibration.")
+
+    def update_screen_tracking_status(self, lost, now, transitioning=False) -> None:
+        if lost:
+            if self.screen_tracking_loss_since is None:
+                self.screen_tracking_loss_since = now
+            # Menu fades briefly hide the reference patches; recognition still waits.
+            warning_delay = 10.0 if transitioning else 2.0
+            if now - self.screen_tracking_loss_since >= warning_delay and not self.screen_tracking_lost:
+                self.screen_tracking_lost = True
+                self.event_queue.put(("screen_tracking", True))
+        else:
+            self.screen_tracking_loss_since = None
+            if self.screen_tracking_lost:
+                self.screen_tracking_lost = False
+                self.event_queue.put(("screen_tracking", False))
+
     def start_detection(self) -> None:
+        if self.webcam_mode_var.get() and self.screen_tracker is None:
+            self.status_var.set("Set the four screen corners first.")
+            return
         if self.search_stopped_event.is_set():
             return
         self.save_config()
@@ -437,6 +531,9 @@ class ClockDetectorGui:
         self.root.after(100, self.start_detection)
 
     def stop_searching(self) -> None:
+        self.tracking_warning_visible = False
+        self.selecting_screen = False
+        self.screen_selection_frame = None
         self.detect_event.clear()
         self.search_stopped_event.set()
         self.capture_enabled_event.clear()
@@ -461,6 +558,9 @@ class ClockDetectorGui:
         self.canvas.configure(cursor="")
 
     def begin_alignment_selection(self) -> None:
+        if self.webcam_mode_var.get() and (self.screen_tracker is None or self.selecting_screen):
+            self.status_var.set("Set the four screen corners first.")
+            return
         if self.search_stopped_event.is_set():
             self.status_var.set("Searching is stopped. Press Restart first.")
             return
@@ -715,29 +815,6 @@ class ClockDetectorGui:
         )
         stable_window_size = int(self.config.get("stable_window_size", 6))
         lost_frames_required = int(self.config["lost_frames_required"])
-        prefer_later = bool(self.config.get("prefer_later_stage_when_close", True))
-        later_margin = float(self.config.get("later_stage_close_margin", 0.04))
-        pairwise_refinement_enabled = bool(self.config.get("pairwise_refinement_enabled", True))
-        pairwise_close_margin = float(self.config.get("pairwise_close_margin", 0.2))
-        pairwise_hand_weight = float(
-            self.config.get("pairwise_hand_weight", 0.9)
-        )
-        pairwise_refinement_pairs = tuple(
-            tuple(str(label) for label in pair)
-            for pair in self.config.get(
-                "pairwise_refinement_pairs",
-                [["1", "7"], ["2", "7"], ["2", "3"]],
-            )
-            if len(pair) == 2
-        )
-        classification_method = str(self.config.get("classification_method", "hand_geometry"))
-        geometry_min_score = float(self.config.get("geometry_min_score", 0.35))
-        geometry_min_margin = float(self.config.get("geometry_min_margin", 0.02))
-        geometry_alignment_radius = int(
-            round(float(self.config.get("geometry_alignment_radius", 2)) * self.processing_scale)
-        )
-        stage_count_value = self.config.get("stage_count")
-        stage_count = int(stage_count_value) if stage_count_value is not None else None
         max_fps = float(self.config.get("max_fps", 20))
         frame_delay = 1.0 / max_fps if max_fps > 0 else 0.0
         preview_delay = 1.0 / max(1.0, float(self.config.get("preview_fps", 10)))
@@ -798,6 +875,38 @@ class ClockDetectorGui:
                     continue
                 if not ok or frame is None:
                     raise RuntimeError("No frame received from the selected window.")
+
+                if self.selecting_screen:
+                    if self.screen_selection_frame is None:
+                        self.screen_selection_frame = frame.copy()
+                    selection_frame = self.screen_selection_frame
+                    if selection_frame is not None:
+                        self.put_latest_frame(selection_frame)
+                    time.sleep(0.05)
+                    continue
+                with self.screen_lock:
+                    tracker = self.screen_tracker
+                    corrected = None if tracker is None else tracker.rectify(frame, started)
+                if tracker is not None:
+                    lost = corrected is None
+                    self.update_screen_tracking_status(lost, started, tracker.black_screen)
+                    if tracker.dark_frames >= 2:
+                        # A fade separates clocks even if contour tracking is unavailable.
+                        stable_labels.clear()
+                        clock_was_visible = False
+                        number_saved = False
+                        lost_frames = 0
+                        possible_clock_seen = False
+                        possible_clock_lost_frames = 0
+                        waited_below_threshold = False
+                        last_label = None
+                        last_label_score = 0.0
+                    if lost or tracker.black_screen:
+                        elapsed = time.monotonic() - started
+                        if elapsed < target_frame_delay:
+                            time.sleep(target_frame_delay - elapsed)
+                        continue
+                    frame = corrected
 
                 with self.alignment_request_lock:
                     alignment_waiting = self.pending_alignment_box is not None
@@ -1161,7 +1270,7 @@ class ClockDetectorGui:
             except queue.Empty:
                 pass
 
-            if new_frame and self.current_frame is not None:
+            if new_frame and self.current_frame is not None and not self.screen_tracking_lost:
                 self.draw_frame(self.current_frame)
 
         try:
@@ -1171,7 +1280,17 @@ class ClockDetectorGui:
                     continue
                 if event[0] == "alignment_found" and event[6] != self.alignment_generation:
                     continue
-                if event[0] == "number":
+                if event[0] == "screen_tracking":
+                    self.tracking_warning_visible = event[1]
+                    self.status_var.set(
+                        "Screen tracking lost. Please bring all four calibration points back into view."
+                        if event[1] else "Screen tracking restored. Detection can continue."
+                    )
+                    if event[1]:
+                        self.draw_tracking_warning()
+                    elif self.current_frame is not None:
+                        self.draw_frame(self.current_frame)
+                elif event[0] == "number":
                     number = event[1]
                     numbers = event[2]
                     score = event[3]
@@ -1219,11 +1338,28 @@ class ClockDetectorGui:
                         self.config.get("obs_content_small_clock_pixel_limit", 35)
                     ):
                         self.status_var.set(
-                            f"OBS image aligned at low resolution (score {score:.3f})."
+                            "Clock calibrated at low resolution. Restart the game, then press Restart."
                         )
                     else:
                         self.status_var.set(
-                            f"OBS image aligned (score {score:.3f}). Detection is running."
+                            "Clock calibrated. Restart the game, then press Restart before the first clock."
+                        )
+                    if not self.calibration_restart_notice_shown:
+                        self.calibration_restart_notice_shown = True
+                        capture_guidance = (
+                            "Keep the camera and console in the same position. "
+                            if self.webcam_mode_var.get() else
+                            "Keep the capture window and image scale unchanged. "
+                        )
+                        messagebox.showinfo(
+                            "Restart the Game After Calibration",
+                            "Calibration is complete.\n\n"
+                            "Restart the game before collecting your clock sequence. "
+                            "The clock used for calibration is not included in the sequence.\n\n"
+                            + capture_guidance
+                            + "After restarting the game, click \"Restart\" in this tool "
+                            "before showing the first clock.",
+                            parent=self.root,
                         )
                 elif event[0] == "alignment_failed":
                     self.status_var.set(
@@ -1304,6 +1440,9 @@ class ClockDetectorGui:
         self.templates_canvas.itemconfigure(self.templates_window, width=max(event.width, requested_width))
 
     def draw_frame(self, frame) -> None:
+        if self.tracking_warning_visible:
+            self.draw_tracking_warning()
+            return
         canvas_width = max(1, self.canvas.winfo_width())
         canvas_height = max(1, self.canvas.winfo_height())
         frame_height, frame_width = frame.shape[:2]
@@ -1319,6 +1458,11 @@ class ClockDetectorGui:
 
         self.canvas.delete("all")
         self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self.photo)
+        if self.selecting_screen:
+            for index, (x, y) in enumerate(self.screen_points, 1):
+                px, py = offset_x + x * scale, offset_y + y * scale
+                self.canvas.create_oval(px-5, py-5, px+5, py+5, outline="#4fc3f7", width=2)
+                self.canvas.create_text(px+12, py, text=str(index), fill="#4fc3f7")
 
         if (
             self.selecting_alignment
@@ -1342,12 +1486,36 @@ class ClockDetectorGui:
         self.display_offset_x = offset_x
         self.display_offset_y = offset_y
 
+    def resize_preview_warning(self, _event=None) -> None:
+        if self.tracking_warning_visible and not self.search_stopped_event.is_set():
+            self.draw_tracking_warning()
+
+    def draw_tracking_warning(self) -> None:
+        width = max(200, self.canvas.winfo_width())
+        height = max(200, self.canvas.winfo_height())
+        self.draw_black_preview()
+        self.canvas.create_rectangle(0, 0, width, height, fill="#260b0d", outline="", tags="tracking_warning")
+        self.canvas.create_text(
+            width / 2, height / 2 - 65, text="SCREEN TRACKING LOST",
+            font=("Segoe UI", 24, "bold"), fill="#ff7979", width=width - 40,
+            justify="center", anchor="s", tags="tracking_warning",
+        )
+        self.canvas.create_text(
+            width / 2, height / 2 - 30,
+            text="Please bring all four calibration points back into view.\n\nRecognition is paused.",
+            font=("Segoe UI", 13, "bold"), fill="#ffffff", width=width - 48,
+            justify="center", anchor="n", tags="tracking_warning",
+        )
+
     def draw_black_preview(self) -> None:
         self.photo = None
         self.canvas.delete("all")
         self.canvas.configure(bg="#000000")
 
     def start_alignment_drag(self, event) -> None:
+        if self.selecting_screen:
+            self.add_screen_corner(event)
+            return
         if not self.selecting_alignment:
             return
         point = self.clamp_canvas_point_to_frame(event.x, event.y)

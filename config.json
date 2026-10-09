@@ -1,5 +1,5 @@
 {
-  "window_title_contains": "Citra Nightly 2103",
+  "window_title_contains": "",
   "templates_dir": "templates",
   "processing_scale": 1.0,
   "obs_content_alignment_threshold": 0.9,
@@ -9,7 +9,6 @@
   "obs_content_small_clock_pixel_limit": 35,
   "obs_content_small_clock_threshold": 0.9,
   "show_score_debug": false,
-  "use_previous_template_after_threshold": false,
   "quality_variants": true,
   "first_on_appear_output_offset": 4,
   "roi": {

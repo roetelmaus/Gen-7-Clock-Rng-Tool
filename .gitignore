@@ -4,6 +4,13 @@ build*/
 dist*/
 standalone*/
 *.spec
+!Gen 7 Clock RNG V2.1.spec
 *.exe
 .venv/
 venv/
+camo_diagnostics/
+test_camo_live.py
+check_camo_clock.py
+analyze_camo_video.py
+*.avi
+*.mp4
